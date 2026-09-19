@@ -1,0 +1,112 @@
+name: MarketX Market Session
+
+on:
+  schedule:
+    # 09:00 IST = 03:30 UTC, Monday-Friday.
+    - cron: "30 3 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: Session phase (1=09:00-14:50 IST, 2=14:50-20:40 IST, 3=20:40-23:50 IST)
+        required: false
+        default: "1"
+        type: choice
+        options:
+          - "1"
+          - "2"
+          - "3"
+      symbol:
+        description: Trade99 symbol
+        required: false
+        default: "CRUDEOIL26SEPFUT"
+        type: string
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  market_session:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    env:
+      MARKETX_SYMBOL: ${{ inputs.symbol || 'CRUDEOIL26SEPFUT' }}
+      MARKETX_TRADE99_URL: https://trade99.live:3000
+      SUPABASE_URL: https://ynluiynxwnuubxcmxude.supabase.co
+      SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+      MARKETX_BATCH_SIZE: "50"
+      MARKETX_FLUSH_SECONDS: "0.5"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Validate secret
+        run: |
+          test -n "$SUPABASE_SECRET_KEY" || {
+            echo "SUPABASE_SECRET_KEY is not configured in repository secrets."
+            exit 1
+          }
+
+      - name: Start MarketX bridge
+        run: |
+          nohup python marketx_tick_bridge.py > marketx-session.log 2>&1 &
+          echo $! > marketx-session.pid
+          sleep 15
+          tail -n 50 marketx-session.log
+
+      - name: Keep session inside market hours
+        env:
+          PHASE: ${{ inputs.phase || '1' }}
+        run: |
+          python - <<'PY'
+          import os
+          import time
+          from datetime import datetime, timezone
+
+          phase = os.environ.get("PHASE", "1")
+          targets = {
+              "1": (9, 20),   # 14:50 IST = 09:20 UTC
+              "2": (15, 10),  # 20:40 IST = 15:10 UTC
+              "3": (18, 20),  # 23:50 IST = 18:20 UTC
+          }
+
+          target_hour, target_minute = targets[phase]
+          now = datetime.now(timezone.utc)
+          target = now.replace(hour=target_hour, minute=target_minute, second=0, microsecond=0)
+
+          # If the job started after today's target, end this phase immediately.
+          seconds = max(0, (target - now).total_seconds())
+          print(f"Phase {phase}: current UTC={now.isoformat()} target UTC={target.isoformat()} seconds={int(seconds)}")
+          time.sleep(seconds)
+          PY
+
+      - name: Start next market phase
+        if: success() && (inputs.phase == '' || inputs.phase == '1' || inputs.phase == '2')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURRENT_PHASE: ${{ inputs.phase || '1' }}
+        run: |
+          if [ "$CURRENT_PHASE" = "1" ]; then
+            NEXT_PHASE=2
+          else
+            NEXT_PHASE=3
+          fi
+
+          gh workflow run marketx_market_session.yml             --ref main             -f phase="$NEXT_PHASE"             -f symbol="$MARKETX_SYMBOL"
+
+      - name: Stop MarketX bridge
+        if: always()
+        run: |
+          if [ -f marketx-session.pid ]; then
+            kill "$(cat marketx-session.pid)" 2>/dev/null || true
+          fi
+          tail -n 100 marketx-session.log 2>/dev/null || true
