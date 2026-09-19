@@ -3,8 +3,13 @@ name: MarketX Market Session
 
 on:
   schedule:
-    # 09:00 IST = 03:30 UTC, Monday-Friday.
+    # Three independent weekday starts.
+    # 09:00 IST = 03:30 UTC
+    # 14:50 IST = 09:20 UTC
+    # 20:40 IST = 15:10 UTC
     - cron: "30 3 * * 1-5"
+    - cron: "20 9 * * 1-5"
+    - cron: "10 15 * * 1-5"
   workflow_dispatch:
     inputs:
       phase:
@@ -66,43 +71,37 @@ jobs:
 
       - name: Keep session inside market hours
         env:
-          PHASE: ${{ inputs.phase || '1' }}
+          REQUESTED_PHASE: ${{ inputs.phase }}
         run: |
           python - <<'PY'
           import os
           import time
           from datetime import datetime, timezone
 
-          phase = os.environ.get("PHASE", "1")
-          targets = {
-              "1": (9, 20),   # 14:50 IST = 09:20 UTC
-              "2": (15, 10),  # 20:40 IST = 15:10 UTC
-              "3": (18, 20),  # 23:50 IST = 18:20 UTC
-          }
-
-          target_hour, target_minute = targets[phase]
+          requested = os.environ.get("REQUESTED_PHASE", "").strip()
           now = datetime.now(timezone.utc)
-          target = now.replace(hour=target_hour, minute=target_minute, second=0, microsecond=0)
 
-          # If the job started after today's target, end this phase immediately.
+          if requested in {"1", "2", "3"}:
+              phase = requested
+          else:
+              minutes = now.hour * 60 + now.minute
+              if 3 * 60 + 30 <= minutes < 9 * 60 + 20:
+                  phase = "1"
+              elif 9 * 60 + 20 <= minutes < 15 * 60 + 10:
+                  phase = "2"
+              elif 15 * 60 + 10 <= minutes < 18 * 60 + 20:
+                  phase = "3"
+              else:
+                  print(f"Outside scheduled market session: {now.isoformat()}")
+                  raise SystemExit(0)
+
+          targets = {"1": (9, 20), "2": (15, 10), "3": (18, 20)}
+          target_hour, target_minute = targets[phase]
+          target = now.replace(hour=target_hour, minute=target_minute, second=0, microsecond=0)
           seconds = max(0, (target - now).total_seconds())
-          print(f"Phase {phase}: current UTC={now.isoformat()} target UTC={target.isoformat()} seconds={int(seconds)}")
+          print(f"MARKETX PHASE {phase} | start={now.isoformat()} stop={target.isoformat()} | seconds={int(seconds)}")
           time.sleep(seconds)
           PY
-
-      - name: Start next market phase
-        if: success() && (inputs.phase == '' || inputs.phase == '1' || inputs.phase == '2')
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CURRENT_PHASE: ${{ inputs.phase || '1' }}
-        run: |
-          if [ "$CURRENT_PHASE" = "1" ]; then
-            NEXT_PHASE=2
-          else
-            NEXT_PHASE=3
-          fi
-
-          gh workflow run marketx_market_session.yml             --ref main             -f phase="$NEXT_PHASE"             -f symbol="$MARKETX_SYMBOL"
 
       - name: Stop MarketX bridge
         if: always()
