@@ -36,6 +36,7 @@ SYMBOL = os.environ.get("MARKETX_SYMBOL", "CRUDEOIL26SEPFUT").strip()
 DB_PATH = os.environ.get("MARKETX_SYNC_DB", "marketx_sync.db")
 PAGE_SIZE = int(os.environ.get("MARKETX_PAGE_SIZE", "1000"))
 POLL_SECONDS = float(os.environ.get("MARKETX_POLL_SECONDS", "1"))
+VERIFY_SECONDS = float(os.environ.get("MARKETX_VERIFY_SECONDS", "30"))
 
 if not SUPABASE_PUBLISHABLE_KEY:
     raise SystemExit("SUPABASE_PUBLISHABLE_KEY is required")
@@ -135,6 +136,98 @@ def fetch_page(last_id):
     return response.json()
 
 
+
+def verify_rows(db, rows):
+    if not rows:
+        return 0
+    ids = [int(row["id"]) for row in rows]
+    placeholders = ",".join("?" for _ in ids)
+    local_rows = db.execute(
+        f"SELECT id, tick_fingerprint FROM market_snapshots "
+        f"WHERE symbol = ? AND id IN ({placeholders})",
+        (SYMBOL, *ids),
+    ).fetchall()
+    local = {int(row[0]): row[1] for row in local_rows}
+    mismatches = []
+    for row in rows:
+        row_id = int(row["id"])
+        if local.get(row_id) != row.get("tick_fingerprint"):
+            mismatches.append(row_id)
+    if mismatches:
+        raise RuntimeError(
+            f"INTEGRITY FAILURE: {len(mismatches)} fingerprint mismatches; "
+            f"first_ids={mismatches[:10]}"
+        )
+    return len(rows)
+
+
+def remote_count_through(last_id):
+    response = session.head(
+        REST_URL,
+        params={"select": "id", "symbol": f"eq.{SYMBOL}", "id": f"lte.{last_id}"},
+        headers={"Prefer": "count=exact"},
+        timeout=20,
+    )
+    response.raise_for_status()
+    content_range = response.headers.get("Content-Range", "")
+    if "/" not in content_range:
+        raise RuntimeError("INTEGRITY FAILURE: Supabase did not return Content-Range")
+    return int(content_range.rsplit("/", 1)[1])
+
+
+def verify_checkpoint(db):
+    last_id = get_last_id(db)
+    if last_id <= 0:
+        return {"status": "WAITING", "last_id": 0}
+    remote_count = remote_count_through(last_id)
+    local_count = db.execute(
+        "SELECT COUNT(*) FROM market_snapshots WHERE symbol = ? AND id <= ?",
+        (SYMBOL, last_id),
+    ).fetchone()[0]
+    if remote_count != local_count:
+        raise RuntimeError(
+            f"INTEGRITY FAILURE: checkpoint count remote={remote_count} "
+            f"local={local_count} through_id={last_id}"
+        )
+    return {
+        "status": "SYNC OK",
+        "last_id": last_id,
+        "remote_count": remote_count,
+        "local_count": local_count,
+    }
+
+
+def sync_lag(db):
+    response = session.get(
+        REST_URL,
+        params={
+            "select": "id,received_at,tick_fingerprint",
+            "symbol": f"eq.{SYMBOL}",
+            "order": "id.desc",
+            "limit": "1",
+        },
+        timeout=20,
+    )
+    response.raise_for_status()
+    rows = response.json()
+    if not rows:
+        return {"status": "NO_REMOTE_DATA"}
+    remote = rows[0]
+    local = db.execute(
+        "SELECT id, received_at, tick_fingerprint "
+        "FROM market_snapshots WHERE symbol = ? ORDER BY id DESC LIMIT 1",
+        (SYMBOL,),
+    ).fetchone()
+    if not local:
+        return {"status": "LAGGING", "remote_id": int(remote["id"]), "local_id": 0}
+    return {
+        "status": "SYNC OK" if int(local[0]) == int(remote["id"]) and local[2] == remote.get("tick_fingerprint") else "LAGGING",
+        "remote_id": int(remote["id"]),
+        "local_id": int(local[0]),
+        "id_gap": int(remote["id"]) - int(local[0]),
+        "fingerprint_match": local[2] == remote.get("tick_fingerprint"),
+    }
+
 def store_page(db, rows):
     if not rows:
         return 0, None
@@ -174,10 +267,11 @@ def sync_once(db):
         _, newest_id = store_page(db, rows)
         total += db.total_changes - before
 
+        verify_rows(db, rows)
         print(
             f"MARKETX SYNC | {SYMBOL} | "
             f"received={len(rows)} stored={db.total_changes - before} "
-            f"last_id={newest_id}",
+            f"last_id={newest_id} | EXACT",
             flush=True,
         )
 
@@ -187,6 +281,7 @@ def sync_once(db):
 
 def main():
     db = open_db()
+    last_verify = 0.0
 
     print(
         f"MARKETX SYNC START | symbol={SYMBOL} | "
@@ -197,6 +292,12 @@ def main():
     while True:
         try:
             sync_once(db)
+            now = time.monotonic()
+            if now - last_verify >= VERIFY_SECONDS:
+                checkpoint = verify_checkpoint(db)
+                lag = sync_lag(db)
+                print(f"MARKETX INTEGRITY | {checkpoint} | LIVE={lag}", flush=True)
+                last_verify = now
         except KeyboardInterrupt:
             print("MARKETX SYNC STOPPED", flush=True)
             break
