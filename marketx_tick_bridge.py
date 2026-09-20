@@ -14,12 +14,14 @@ SUPABASE_SECRET_KEY = os.environ.get("SUPABASE_SECRET_KEY", "")
 BATCH_SIZE = int(os.environ.get("MARKETX_BATCH_SIZE", "50"))
 FLUSH_SECONDS = float(os.environ.get("MARKETX_FLUSH_SECONDS", "0.5"))
 HEALTH_SECONDS = float(os.environ.get("MARKETX_HEALTH_SECONDS", "10"))
+GAP_SECONDS = float(os.environ.get("MARKETX_GAP_SECONDS", "30"))
 
 if not SUPABASE_URL or not SUPABASE_SECRET_KEY:
     raise SystemExit("SUPABASE_URL and SUPABASE_SECRET_KEY are required")
 
 TABLE_URL = f"{SUPABASE_URL}/rest/v1/market_snapshots"
 HEALTH_URL = f"{SUPABASE_URL}/rest/v1/marketx_bridge_health"
+CAPTURE_GAPS_URL = f"{SUPABASE_URL}/rest/v1/marketx_capture_gaps"
 
 session = requests.Session()
 headers = {
@@ -49,6 +51,9 @@ last_tick_received_at = None
 last_upload_at = None
 last_error = None
 bridge_connected = False
+previous_health = None
+previous_health_loaded = False
+last_gap_checked_tick = None
 
 
 def now_iso():
@@ -137,6 +142,73 @@ def health_snapshot():
         }
 
 
+def load_previous_health():
+    global previous_health, previous_health_loaded
+    try:
+        response = session.get(
+            HEALTH_URL,
+            params={
+                "select": "symbol,process_started_at,last_tick_received_at,last_upload_at,"
+                          "last_error,pending_ticks,bridge_connected,updated_at",
+                "symbol": f"eq.{SYMBOL}",
+                "limit": "1",
+            },
+            timeout=10,
+        )
+        response.raise_for_status()
+        rows = response.json()
+        previous_health = rows[0] if rows else None
+    except Exception as exc:
+        print(f"HEALTH READ ERROR: {exc}", flush=True)
+    previous_health_loaded = True
+
+
+def record_capture_gap(first_tick_time):
+    global last_gap_checked_tick
+    if not previous_health or not previous_health.get("last_tick_received_at"):
+        return
+    if last_gap_checked_tick == previous_health.get("last_tick_received_at"):
+        return
+
+    previous_tick = datetime.fromisoformat(
+        previous_health["last_tick_received_at"].replace("Z", "+00:00")
+    )
+    gap_seconds = (first_tick_time - previous_tick).total_seconds()
+
+    if gap_seconds <= GAP_SECONDS:
+        last_gap_checked_tick = previous_health["last_tick_received_at"]
+        return
+
+    payload = {
+        "symbol": SYMBOL,
+        "gap_start": previous_health["last_tick_received_at"],
+        "gap_end": first_tick_time.isoformat(),
+        "gap_seconds": gap_seconds,
+        "reason": "PROCESS_RESTART_OR_CAPTURE_INTERRUPTION",
+        "bridge_was_connected": previous_health.get("bridge_connected"),
+        "process_started_at": previous_health.get("process_started_at"),
+        "last_tick_received_at": previous_health.get("last_tick_received_at"),
+        "first_tick_after_gap_at": first_tick_time.isoformat(),
+        "resolved": True,
+    }
+
+    try:
+        response = session.post(
+            CAPTURE_GAPS_URL,
+            json=payload,
+            timeout=10,
+        )
+        response.raise_for_status()
+        print(
+            f"MARKETX CAPTURE GAP | {gap_seconds:.1f}s | "
+            f"{previous_health['last_tick_received_at']} -> {first_tick_time.isoformat()}",
+            flush=True,
+        )
+        last_gap_checked_tick = previous_health["last_tick_received_at"]
+    except Exception as exc:
+        print(f"CAPTURE GAP LOG ERROR: {exc}", flush=True)
+
+
 def publish_health():
     payload = health_snapshot()
     try:
@@ -176,12 +248,19 @@ def symbol_subscribed(data):
 @sio.on("scrip_data")
 def scrip_data(packet):
     global last_tick_received_at
+    global previous_health_loaded
     data = packet.get("data", {}) if isinstance(packet, dict) else {}
     if data.get("Symbol") != SYMBOL:
         return
 
+    tick_time = datetime.now(timezone.utc)
+
+    if not previous_health_loaded:
+        load_previous_health()
+    record_capture_gap(tick_time)
+
     with health_lock:
-        last_tick_received_at = datetime.now(timezone.utc)
+        last_tick_received_at = tick_time
 
     with lock:
         pending.append(normalize_tick(data))
@@ -200,6 +279,7 @@ def disconnect():
 
 def main():
     print(f"MARKETX BRIDGE START | symbol={SYMBOL}", flush=True)
+    load_previous_health()
     threading.Thread(target=health_loop, daemon=True).start()
 
     while True:
