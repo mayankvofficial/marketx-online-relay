@@ -5,9 +5,9 @@ MarketX Supabase -> local SQLite synchronizer.
 Direction:
     public.market_snapshots -> local SQLite
 
-The sync is incremental. It remembers the highest Supabase row id already
-stored for each symbol, then fetches only newer rows. It is safe to restart
-and does not require the Supabase secret/service_role key.
+The sync is incremental and verified. It remembers the highest Supabase row
+id already stored for each symbol, fetches only newer rows, verifies tick
+fingerprints, and checks checkpoint counts.
 
 Environment:
     SUPABASE_URL
@@ -18,6 +18,8 @@ Optional:
     MARKETX_SYNC_DB=marketx_sync.db
     MARKETX_PAGE_SIZE=1000
     MARKETX_POLL_SECONDS=1
+    MARKETX_VERIFY_SECONDS=30
+    MARKETX_HEALTH_STALE_SECONDS=30
 """
 
 import os
@@ -37,11 +39,13 @@ DB_PATH = os.environ.get("MARKETX_SYNC_DB", "marketx_sync.db")
 PAGE_SIZE = int(os.environ.get("MARKETX_PAGE_SIZE", "1000"))
 POLL_SECONDS = float(os.environ.get("MARKETX_POLL_SECONDS", "1"))
 VERIFY_SECONDS = float(os.environ.get("MARKETX_VERIFY_SECONDS", "30"))
+HEALTH_STALE_SECONDS = float(os.environ.get("MARKETX_HEALTH_STALE_SECONDS", "30"))
 
 if not SUPABASE_PUBLISHABLE_KEY:
     raise SystemExit("SUPABASE_PUBLISHABLE_KEY is required")
 
 REST_URL = f"{SUPABASE_URL}/rest/v1/market_snapshots"
+HEALTH_URL = f"{SUPABASE_URL}/rest/v1/marketx_bridge_health"
 
 session = requests.Session()
 session.headers.update({
@@ -61,7 +65,6 @@ def open_db():
     db = sqlite3.connect(DB_PATH)
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA synchronous=NORMAL")
-
     db.execute("""
         CREATE TABLE IF NOT EXISTS market_snapshots (
             id INTEGER NOT NULL,
@@ -89,7 +92,6 @@ def open_db():
             PRIMARY KEY (symbol, id)
         )
     """)
-
     db.execute("""
         CREATE TABLE IF NOT EXISTS sync_state (
             symbol TEXT PRIMARY KEY,
@@ -97,7 +99,6 @@ def open_db():
             updated_at TEXT NOT NULL
         )
     """)
-
     db.commit()
     return db
 
@@ -136,7 +137,6 @@ def fetch_page(last_id):
     return response.json()
 
 
-
 def verify_rows(db, rows):
     if not rows:
         return 0
@@ -149,14 +149,18 @@ def verify_rows(db, rows):
     ).fetchall()
     local = {int(row[0]): row[1] for row in local_rows}
     mismatches = []
+    missing = []
     for row in rows:
         row_id = int(row["id"])
-        if local.get(row_id) != row.get("tick_fingerprint"):
+        if row_id not in local:
+            missing.append(row_id)
+        elif local[row_id] != row.get("tick_fingerprint"):
             mismatches.append(row_id)
-    if mismatches:
+    if missing or mismatches:
         raise RuntimeError(
-            f"INTEGRITY FAILURE: {len(mismatches)} fingerprint mismatches; "
-            f"first_ids={mismatches[:10]}"
+            f"INTEGRITY FAILURE: missing={len(missing)} "
+            f"fingerprint_mismatches={len(mismatches)} "
+            f"first_missing={missing[:5]} first_mismatch={mismatches[:5]}"
         )
     return len(rows)
 
@@ -228,6 +232,57 @@ def sync_lag(db):
         "fingerprint_match": local[2] == remote.get("tick_fingerprint"),
     }
 
+
+def bridge_health():
+    response = session.get(
+        HEALTH_URL,
+        params={
+            "select": "symbol,process_started_at,last_tick_received_at,last_upload_at,"
+                      "last_error,pending_ticks,bridge_connected,updated_at",
+            "symbol": f"eq.{SYMBOL}",
+            "limit": "1",
+        },
+        timeout=10,
+    )
+    response.raise_for_status()
+    rows = response.json()
+    if not rows:
+        return {"status": "NO_HEALTH_RECORD"}
+
+    h = rows[0]
+    now = datetime.now(timezone.utc)
+
+    def age(value):
+        if not value:
+            return None
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return max(0.0, (now - dt).total_seconds())
+
+    tick_age = age(h.get("last_tick_received_at"))
+    update_age = age(h.get("updated_at"))
+
+    if update_age is None or update_age > HEALTH_STALE_SECONDS:
+        status = "BRIDGE DOWN / HEARTBEAT STALE"
+    elif not h.get("bridge_connected"):
+        status = "TRADE99 DISCONNECTED"
+    elif tick_age is None:
+        status = "WAITING FOR FIRST TICK"
+    elif tick_age > HEALTH_STALE_SECONDS:
+        status = "STALE / NO NEW TICKS"
+    else:
+        status = "LIVE"
+
+    return {
+        "status": status,
+        "last_tick": h.get("last_tick_received_at"),
+        "tick_age_sec": round(tick_age, 1) if tick_age is not None else None,
+        "last_upload": h.get("last_upload_at"),
+        "heartbeat_age_sec": round(update_age, 1) if update_age is not None else None,
+        "pending": h.get("pending_ticks"),
+        "error": h.get("last_error"),
+    }
+
+
 def store_page(db, rows):
     if not rows:
         return 0, None
@@ -239,39 +294,33 @@ def store_page(db, rows):
         ({",".join(COLUMNS)}, synced_at)
         VALUES ({placeholders})
     """
-
-    values = []
-    for row in rows:
-        values.append(tuple(row.get(col) for col in COLUMNS) + (now,))
-
+    values = [
+        tuple(row.get(col) for col in COLUMNS) + (now,)
+        for row in rows
+    ]
+    before = db.total_changes
     db.executemany(sql, values)
     newest_id = max(int(row["id"]) for row in rows)
     set_last_id(db, newest_id)
     db.commit()
-
-    stored = db.total_changes
-    return stored, newest_id
+    return db.total_changes - before, newest_id
 
 
 def sync_once(db):
     total = 0
-
     while True:
         last_id = get_last_id(db)
         rows = fetch_page(last_id)
-
         if not rows:
             return total
 
-        before = db.total_changes
-        _, newest_id = store_page(db, rows)
-        total += db.total_changes - before
-
+        stored, newest_id = store_page(db, rows)
+        total += stored
         verify_rows(db, rows)
+
         print(
             f"MARKETX SYNC | {SYMBOL} | "
-            f"received={len(rows)} stored={db.total_changes - before} "
-            f"last_id={newest_id} | EXACT",
+            f"received={len(rows)} stored={stored} last_id={newest_id} | EXACT",
             flush=True,
         )
 
@@ -296,7 +345,18 @@ def main():
             if now - last_verify >= VERIFY_SECONDS:
                 checkpoint = verify_checkpoint(db)
                 lag = sync_lag(db)
-                print(f"MARKETX INTEGRITY | {checkpoint} | LIVE={lag}", flush=True)
+                health = bridge_health()
+                print(f"MARKETX INTEGRITY | {checkpoint} | SYNC={lag}", flush=True)
+                print(
+                    f"MARKETX BRIDGE HEALTH | LAST TICK: {health.get('last_tick')} | "
+                    f"TICK AGE: {health.get('tick_age_sec')} sec | "
+                    f"STATUS: {health.get('status')} | "
+                    f"LAST UPLOAD: {health.get('last_upload')} | "
+                    f"HEARTBEAT AGE: {health.get('heartbeat_age_sec')} sec | "
+                    f"PENDING: {health.get('pending')} | "
+                    f"ERROR: {health.get('error')}",
+                    flush=True,
+                )
                 last_verify = now
         except KeyboardInterrupt:
             print("MARKETX SYNC STOPPED", flush=True)
