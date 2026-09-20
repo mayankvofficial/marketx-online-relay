@@ -62,19 +62,14 @@ jobs:
             exit 1
           }
 
-      - name: Start MarketX bridge
-        run: |
-          nohup python marketx_tick_bridge.py > marketx-session.log 2>&1 &
-          echo $! > marketx-session.pid
-          sleep 15
-          tail -n 50 marketx-session.log
-
-      - name: Keep session inside market hours
+      - name: Run MarketX bridge under watchdog supervisor
         env:
           REQUESTED_PHASE: ${{ inputs.phase }}
         run: |
           python - <<'PY'
           import os
+          import signal
+          import subprocess
           import time
           from datetime import datetime, timezone
 
@@ -98,10 +93,66 @@ jobs:
           targets = {"1": (9, 20), "2": (15, 10), "3": (18, 20)}
           target_hour, target_minute = targets[phase]
           target = now.replace(hour=target_hour, minute=target_minute, second=0, microsecond=0)
-          seconds = max(0, (target - now).total_seconds())
-          print(f"MARKETX PHASE {phase} | start={now.isoformat()} stop={target.isoformat()} | seconds={int(seconds)}")
-          time.sleep(seconds)
+          end_time = max(now, target)
+
+          log = open("marketx-session.log", "a", buffering=1)
+          restarts = 0
+          child = None
+
+          def start_bridge():
+              global restarts
+              restarts += 1
+              print(f"MARKETX WATCHDOG | starting bridge | restart_count={restarts}", flush=True)
+              return subprocess.Popen(
+                  ["python", "marketx_tick_bridge.py"],
+                  stdout=log,
+                  stderr=subprocess.STDOUT,
+                  start_new_session=True,
+              )
+
+          def stop_bridge():
+              if child is None or child.poll() is not None:
+                  return
+              try:
+                  os.killpg(child.pid, signal.SIGTERM)
+                  child.wait(timeout=10)
+              except Exception:
+                  try:
+                      os.killpg(child.pid, signal.SIGKILL)
+                  except Exception:
+                      pass
+
+          print(
+              f"MARKETX WATCHDOG | phase={phase} | "
+              f"start={now.isoformat()} stop={end_time.isoformat()}",
+              flush=True,
+          )
+
+          try:
+              child = start_bridge()
+              while datetime.now(timezone.utc) < end_time:
+                  code = child.poll()
+                  if code is not None:
+                      print(
+                          f"MARKETX WATCHDOG | BRIDGE EXITED code={code} | restarting in 5 sec",
+                          flush=True,
+                      )
+                      time.sleep(5)
+                      if datetime.now(timezone.utc) >= end_time:
+                          break
+                      child = start_bridge()
+                  else:
+                      time.sleep(5)
+          finally:
+              stop_bridge()
+              log.close()
+              print("MARKETX WATCHDOG | session ended", flush=True)
           PY
+
+      - name: Show MarketX session log
+        if: always()
+        run: |
+          tail -n 200 marketx-session.log 2>/dev/null || true
 
       - name: Stop MarketX bridge
         if: always()
