@@ -46,6 +46,7 @@ if not SUPABASE_PUBLISHABLE_KEY:
 
 REST_URL = f"{SUPABASE_URL}/rest/v1/market_snapshots"
 HEALTH_URL = f"{SUPABASE_URL}/rest/v1/marketx_bridge_health"
+GAPS_URL = f"{SUPABASE_URL}/rest/v1/marketx_capture_gaps"
 
 session = requests.Session()
 session.headers.update({
@@ -283,6 +284,22 @@ def bridge_health():
     }
 
 
+def latest_capture_gap():
+    response = session.get(
+        GAPS_URL,
+        params={
+            "select": "detected_at,gap_start,gap_end,gap_seconds,reason,resolved",
+            "symbol": f"eq.{SYMBOL}",
+            "order": "detected_at.desc",
+            "limit": "1",
+        },
+        timeout=10,
+    )
+    response.raise_for_status()
+    rows = response.json()
+    return rows[0] if rows else None
+
+
 def store_page(db, rows):
     if not rows:
         return 0, None
@@ -346,7 +363,12 @@ def main():
                 checkpoint = verify_checkpoint(db)
                 lag = sync_lag(db)
                 health = bridge_health()
+                gap = latest_capture_gap()
                 print(f"MARKETX INTEGRITY | {checkpoint} | SYNC={lag}", flush=True)
+                print(
+                    f"MARKETX CAPTURE GAP | {gap if gap else 'NONE DETECTED'}",
+                    flush=True,
+                )
                 print(
                     f"MARKETX BRIDGE HEALTH | LAST TICK: {health.get('last_tick')} | "
                     f"TICK AGE: {health.get('tick_age_sec')} sec | "
