@@ -62,6 +62,27 @@ jobs:
             exit 1
           }
 
+      - name: Test Supabase API authentication
+        run: |
+          python - <<'PY'
+          import os
+          import requests
+
+          key = os.environ["SUPABASE_SECRET_KEY"].strip()
+          url = os.environ["SUPABASE_URL"].rstrip("/") + "/rest/v1/market_snapshots"
+          r = requests.get(
+              url,
+              params={"select": "id", "limit": "1"},
+              headers={"apikey": key},
+              timeout=15,
+          )
+          print(f"SUPABASE AUTH CHECK | HTTP {r.status_code} | KEY TYPE={'sb_secret' if key.startswith('sb_secret_') else 'legacy_or_other'} | KEY LENGTH={len(key)}")
+          if r.status_code != 200:
+              print("SUPABASE AUTH CHECK BODY:", r.text[:500])
+              raise SystemExit("Supabase API authentication failed.")
+          print("SUPABASE AUTH CHECK: OK")
+          PY
+
       - name: Run MarketX bridge under watchdog supervisor
         env:
           REQUESTED_PHASE: ${{ inputs.phase }}
