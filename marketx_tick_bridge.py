@@ -142,59 +142,54 @@ def flush(force=False):
         response.raise_for_status()
     except requests.HTTPError as exc:
         if exc.response is not None and exc.response.status_code == 409:
-            # A 409 here is the tick_fingerprint unique constraint.
-            # Retry the batch one tick at a time so duplicate ticks can be
-            # safely discarded while genuinely new ticks are still stored.
+            # A 409 is the tick_fingerprint unique constraint. Retry each tick
+            # individually so duplicates can be discarded without blocking
+            # unrelated new ticks in the same batch.
+            completed = set()
             stored = 0
             duplicates = 0
             failed = 0
             for tick in batch:
+                fingerprint = tick.get("tick_fingerprint")
                 try:
                     one = session.post(TABLE_URL, json=[tick], timeout=15)
                     if one.status_code == 409:
                         duplicates += 1
+                        completed.add(fingerprint)
                         continue
                     one.raise_for_status()
                     stored += 1
+                    completed.add(fingerprint)
                 except Exception as one_exc:
                     failed += 1
                     print(f"UPLOAD RETRY ERROR: {one_exc}", flush=True)
 
+            with lock:
+                pending[:] = [
+                    tick for tick in pending
+                    if tick.get("tick_fingerprint") not in completed
+                ]
+            save_pending()
+
             if failed:
-                # Remove only ticks that were confirmed stored or confirmed
-                # duplicate; leave genuinely failed ticks queued.
-                remove_count = stored + duplicates
-                with lock:
-                    del pending[:remove_count]
-                save_pending()
                 set_error(f"UPLOAD RETRY ERROR: {failed} ticks failed")
                 print(
                     f"MARKETX PARTIAL | stored={stored} duplicates={duplicates} "
                     f"failed={failed} | pending={len(pending)}",
                     flush=True,
                 )
-                return
-
-            with lock:
-                del pending[:len(batch)]
-            save_pending()
-            if duplicates:
+            else:
+                last_flush = time.monotonic()
+                with health_lock:
+                    last_upload_at = datetime.now(timezone.utc)
+                    last_error = None
                 print(
-                    f"MARKETX DUPLICATE IGNORED: {duplicates} | "
-                    f"stored={stored} | pending={len(pending)}",
+                    f"MARKETX DUPLICATE CHECK | stored={stored} "
+                    f"duplicates={duplicates} | pending={len(pending)}",
                     flush=True,
                 )
-            else:
-                print(f"MARKETX STORED: {stored} ticks | pending={len(pending)}", flush=True)
-            last_flush = time.monotonic()
-            with health_lock:
-                last_upload_at = datetime.now(timezone.utc)
-                last_error = None
             return
 
-        set_error(f"UPLOAD ERROR: {exc}")
-        print(f"UPLOAD ERROR: {exc}; keeping {len(batch)} ticks queued", flush=True)
-        return
     except Exception as exc:
         set_error(f"UPLOAD ERROR: {exc}")
         print(f"UPLOAD ERROR: {exc}; keeping {len(batch)} ticks queued", flush=True)
