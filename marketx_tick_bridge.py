@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 import time
 import threading
@@ -10,7 +11,7 @@ import socketio
 TRADE99_URL = os.environ.get("MARKETX_TRADE99_URL", "https://trade99.live:3000")
 SYMBOL = os.environ.get("MARKETX_SYMBOL", "CRUDEOIL26SEPFUT").strip()
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
-SUPABASE_SECRET_KEY = os.environ.get("SUPABASE_SECRET_KEY", "")
+SUPABASE_SECRET_KEY = os.environ.get("SUPABASE_SECRET_KEY", "").strip()
 BATCH_SIZE = int(os.environ.get("MARKETX_BATCH_SIZE", "50"))
 FLUSH_SECONDS = float(os.environ.get("MARKETX_FLUSH_SECONDS", "0.5"))
 HEALTH_SECONDS = float(os.environ.get("MARKETX_HEALTH_SECONDS", "10"))
@@ -42,6 +43,7 @@ sio = socketio.Client(
     reconnection_delay_max=10,
 )
 
+PENDING_FILE = os.environ.get("MARKETX_PENDING_FILE", "marketx_pending_ticks.jsonl")
 pending = []
 lock = threading.Lock()
 last_flush = time.monotonic()
@@ -58,6 +60,34 @@ last_gap_checked_tick = None
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
+
+
+def save_pending():
+    with lock:
+        rows = list(pending)
+    tmp = PENDING_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        for row in rows:
+            fh.write(json.dumps(row, separators=(",", ":")) + "\n")
+    os.replace(tmp, PENDING_FILE)
+
+
+def load_pending():
+    if not os.path.exists(PENDING_FILE):
+        return
+    loaded = []
+    try:
+        with open(PENDING_FILE, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    loaded.append(json.loads(line))
+        with lock:
+            pending.extend(loaded)
+        print(f"MARKETX PENDING RECOVERED: {len(loaded)} ticks", flush=True)
+    except Exception as exc:
+        print(f"MARKETX PENDING RECOVERY ERROR: {exc}", flush=True)
+
 
 
 def set_error(message):
@@ -117,6 +147,7 @@ def flush(force=False):
 
     with lock:
         del pending[:len(batch)]
+    save_pending()
 
     last_flush = time.monotonic()
     with health_lock:
@@ -262,8 +293,11 @@ def scrip_data(packet):
     with health_lock:
         last_tick_received_at = tick_time
 
+    tick = normalize_tick(data)
     with lock:
-        pending.append(normalize_tick(data))
+        pending.append(tick)
+        with open(PENDING_FILE, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(tick, separators=(",", ":")) + "\n")
     flush()
 
 
@@ -278,7 +312,9 @@ def disconnect():
 
 
 def main():
-    print(f"MARKETX BRIDGE START | symbol={SYMBOL}", flush=True)
+    key_type = "sb_secret" if SUPABASE_SECRET_KEY.startswith("sb_secret_") else ("legacy_or_other" if SUPABASE_SECRET_KEY else "missing")
+    print(f"MARKETX BRIDGE START | symbol={SYMBOL} | SUPABASE KEY TYPE={key_type} | KEY LENGTH={len(SUPABASE_SECRET_KEY)}", flush=True)
+    load_pending()
     load_previous_health()
     threading.Thread(target=health_loop, daemon=True).start()
 
