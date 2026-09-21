@@ -10,7 +10,7 @@ import requests
 import socketio
 
 TRADE99_URL = os.environ.get("MARKETX_TRADE99_URL", "https://trade99.live:3000")
-SYMBOL = os.environ.get("MARKETX_SYMBOL", "CRUDEOIL26SEPFUT").strip()
+SYMBOL = os.environ.get("MARKETX_SYMBOL", "CRUDEOIL26OCTFUT").strip()
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_SECRET_KEY = os.environ.get("SUPABASE_SECRET_KEY", "").strip()
 BATCH_SIZE = int(os.environ.get("MARKETX_BATCH_SIZE", "50"))
