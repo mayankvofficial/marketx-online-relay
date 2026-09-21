@@ -98,17 +98,37 @@ jobs:
           log = open("marketx-session.log", "a", buffering=1)
           restarts = 0
           child = None
+          stream_threads = []
+
+          def stream_bridge_output(proc):
+              try:
+                  for line in iter(proc.stdout.readline, ""):
+                      print(f"MARKETX BRIDGE | {line}", end="", flush=True)
+                      log.write(line)
+                      log.flush()
+              finally:
+                  try:
+                      proc.stdout.close()
+                  except Exception:
+                      pass
 
           def start_bridge():
               global restarts
               restarts += 1
               print(f"MARKETX WATCHDOG | starting bridge | restart_count={restarts}", flush=True)
-              return subprocess.Popen(
-                  ["python", "marketx_tick_bridge.py"],
-                  stdout=log,
+              proc = subprocess.Popen(
+                  ["python", "-u", "marketx_tick_bridge.py"],
+                  stdout=subprocess.PIPE,
                   stderr=subprocess.STDOUT,
+                  text=True,
+                  bufsize=1,
                   start_new_session=True,
               )
+              import threading
+              thread = threading.Thread(target=stream_bridge_output, args=(proc,), daemon=True)
+              thread.start()
+              stream_threads.append(thread)
+              return proc
 
           def stop_bridge():
               if child is None or child.poll() is not None:
@@ -145,6 +165,8 @@ jobs:
                       time.sleep(5)
           finally:
               stop_bridge()
+              for thread in stream_threads:
+                  thread.join(timeout=2)
               log.close()
               print("MARKETX WATCHDOG | session ended", flush=True)
           PY
