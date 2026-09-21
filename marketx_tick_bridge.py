@@ -50,6 +50,8 @@ last_flush = time.monotonic()
 health_lock = threading.Lock()
 process_started_at = datetime.now(timezone.utc)
 last_tick_received_at = None
+received_tick_count = 0
+stored_tick_count = 0
 last_upload_at = None
 last_error = None
 bridge_connected = False
@@ -128,7 +130,7 @@ def normalize_tick(d):
 
 
 def flush(force=False):
-    global last_flush, last_upload_at
+    global last_flush, last_upload_at, stored_tick_count
 
     with lock:
         if not pending:
@@ -154,7 +156,8 @@ def flush(force=False):
         last_upload_at = datetime.now(timezone.utc)
         last_error = None
 
-    print(f"MARKETX STORED: {len(batch)} ticks | pending={len(pending)}", flush=True)
+    stored_tick_count += len(batch)
+    print(f"MARKETX STORED: {len(batch)} ticks | total_stored={stored_tick_count} | pending={len(pending)}", flush=True)
 
 
 def health_snapshot():
@@ -278,13 +281,16 @@ def symbol_subscribed(data):
 
 @sio.on("scrip_data")
 def scrip_data(packet):
-    global last_tick_received_at
+    global last_tick_received_at, received_tick_count
     global previous_health_loaded
     data = packet.get("data", {}) if isinstance(packet, dict) else {}
     if data.get("Symbol") != SYMBOL:
         return
 
     tick_time = datetime.now(timezone.utc)
+    received_tick_count += 1
+    if received_tick_count == 1 or received_tick_count % 25 == 0:
+        print(f"MARKETX RECEIVED | total_received={received_tick_count}", flush=True)
 
     if not previous_health_loaded:
         load_previous_health()
