@@ -37,10 +37,7 @@ if not SUPABASE_SECRET_KEY.startswith("sb_secret_"):
 session.headers.update(headers)
 
 sio = socketio.Client(
-    reconnection=True,
-    reconnection_attempts=0,
-    reconnection_delay=1,
-    reconnection_delay_max=10,
+    reconnection=False,
 )
 
 PENDING_FILE = os.environ.get("MARKETX_PENDING_FILE", "marketx_pending_ticks.jsonl")
