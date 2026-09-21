@@ -323,13 +323,27 @@ def main():
 
     while True:
         try:
+            # Prevent a reconnect race: socketio.Client.connect() raises
+            # "Already connected" if another connection attempt won the race.
+            if sio.connected:
+                while sio.connected:
+                    time.sleep(0.1)
+                    flush()
+                continue
+
             sio.connect(TRADE99_URL, transports=["websocket"], wait_timeout=20)
+
             while sio.connected:
                 time.sleep(0.1)
                 flush()
+
         except KeyboardInterrupt:
             break
         except Exception as exc:
+            # If the connection became active during a race, keep using it
+            # instead of treating "Already connected" as a real failure.
+            if sio.connected:
+                continue
             set_error(f"CONNECTION ERROR: {exc}")
             print(f"MARKETX CONNECTION ERROR: {exc}", flush=True)
 
