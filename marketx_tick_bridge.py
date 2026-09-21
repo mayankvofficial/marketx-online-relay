@@ -50,6 +50,7 @@ process_started_at = datetime.now(timezone.utc)
 last_tick_received_at = None
 received_tick_count = 0
 stored_tick_count = 0
+previous_evidence_tick = None
 last_upload_at = None
 last_error = None
 bridge_connected = False
@@ -310,7 +311,7 @@ def symbol_subscribed(data):
 
 @sio.on("scrip_data")
 def scrip_data(packet):
-    global last_tick_received_at, received_tick_count
+    global last_tick_received_at, received_tick_count, previous_evidence_tick
     global previous_health_loaded
     data = packet.get("data", {}) if isinstance(packet, dict) else {}
     if data.get("Symbol") != SYMBOL:
@@ -329,6 +330,26 @@ def scrip_data(packet):
         last_tick_received_at = tick_time
 
     tick = normalize_tick(data)
+
+    # Evidence mode: when consecutive events share the same exchange timestamp,
+    # print both payloads and fingerprints. This does NOT deduplicate anything.
+    previous = previous_evidence_tick
+    if previous is not None and tick.get("exchange_time") == previous.get("exchange_time"):
+        same_payload = tick.get("tick_fingerprint") == previous.get("tick_fingerprint")
+        print(
+            "MARKETX SAME-TIME EVIDENCE | "
+            f"exchange_time={tick.get('exchange_time')} | "
+            f"same_payload={same_payload} | "
+            f"PREV={{bid:{previous.get('bid')},ask:{previous.get('ask')},ltp:{previous.get('ltp')},"
+            f"oi:{previous.get('oi')},bid_qty:{previous.get('bid_qty')},ask_qty:{previous.get('ask_qty')},"
+            f"volume:{previous.get('volume')},ltq:{previous.get('ltq')},fp:{previous.get('tick_fingerprint')}}} | "
+            f"CURR={{bid:{tick.get('bid')},ask:{tick.get('ask')},ltp:{tick.get('ltp')},"
+            f"oi:{tick.get('oi')},bid_qty:{tick.get('bid_qty')},ask_qty:{tick.get('ask_qty')},"
+            f"volume:{tick.get('volume')},ltq:{tick.get('ltq')},fp:{tick.get('tick_fingerprint')}}}",
+            flush=True,
+        )
+    previous_evidence_tick = tick
+
     with lock:
         pending.append(tick)
         with open(PENDING_FILE, "a", encoding="utf-8") as fh:
