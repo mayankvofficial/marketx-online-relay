@@ -1,5 +1,6 @@
 import hashlib
 import json
+import tempfile
 import os
 import time
 import threading
@@ -62,13 +63,29 @@ def now_iso():
 
 
 def save_pending():
+    # Socket.IO can dispatch multiple scrip_data callbacks concurrently.
+    # Use a unique temporary file so concurrent persistence calls cannot
+    # replace/delete each other's temp file.
     with lock:
         rows = list(pending)
-    tmp = PENDING_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        for row in rows:
-            fh.write(json.dumps(row, separators=(",", ":")) + "\n")
-    os.replace(tmp, PENDING_FILE)
+        directory = os.path.dirname(os.path.abspath(PENDING_FILE)) or "."
+        fd, tmp = tempfile.mkstemp(
+            prefix=".marketx_pending_",
+            suffix=".tmp",
+            dir=directory,
+            text=True,
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                for row in rows:
+                    fh.write(json.dumps(row, separators=(",", ":")) + "\n")
+            os.replace(tmp, PENDING_FILE)
+        finally:
+            if os.path.exists(tmp):
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
 
 
 def load_pending():
