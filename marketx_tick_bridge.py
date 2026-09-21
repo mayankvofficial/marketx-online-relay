@@ -171,7 +171,22 @@ def flush(force=False):
         last_error = None
 
     stored_tick_count += len(batch)
-    print(f"MARKETX STORED: {len(batch)} ticks | total_stored={stored_tick_count} | pending={len(pending)}", flush=True)
+    if len(batch) == 1:
+        stored_at = batch[0].get("Exchange_Time") or batch[0].get("exchange_time") or batch[0].get("received_at") or now_iso()
+        print(
+            f"MARKETX STORED | tick_time={stored_at} | total_stored={stored_tick_count} | pending={len(pending)}",
+            flush=True,
+        )
+    else:
+        times = [
+            row.get("Exchange_Time") or row.get("exchange_time") or row.get("received_at") or now_iso()
+            for row in batch
+        ]
+        print(
+            f"MARKETX STORED: {len(batch)} ticks | tick_times={times[0]} -> {times[-1]} "
+            f"| total_stored={stored_tick_count} | pending={len(pending)}",
+            flush=True,
+        )
 
 
 def health_snapshot():
