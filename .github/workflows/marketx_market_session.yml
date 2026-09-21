@@ -24,7 +24,7 @@ on:
       symbol:
         description: Trade99 symbol
         required: false
-        default: "CRUDEOIL26SEPFUT"
+        default: "CRUDEOIL26OCTFUT"
         type: string
 
 permissions:
@@ -36,7 +36,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 355
     env:
-      MARKETX_SYMBOL: ${{ inputs.symbol || 'CRUDEOIL26SEPFUT' }}
+      MARKETX_SYMBOL: ${{ inputs.symbol || 'CRUDEOIL26OCTFUT' }}
       MARKETX_TRADE99_URL: https://trade99.live:3000
       SUPABASE_URL: https://ynluiynxwnuubxcmxude.supabase.co
       SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
