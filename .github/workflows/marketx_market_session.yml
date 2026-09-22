@@ -3,19 +3,14 @@ name: MarketX Market Session
 #
 # Each scheduled run gets its own fresh GitHub-hosted runner.
 # The bridge itself is supervised inside the job and restarts if the child
-# process exits. The job is intentionally allowed to run close to GitHub's
-# 6-hour hosted-runner limit so a late scheduled start does not shorten the
-# session because of a fixed market-phase end time.
+# process exits. The bridge stops BEFORE the GitHub job timeout so the
+# supervisor can cleanly terminate the child and exit successfully.
 
 on:
   schedule:
     # 09:00 IST = 03:30 UTC
     # 15:00 IST = 09:30 UTC
     # 21:00 IST = 15:30 UTC
-    #
-    # Each run is independent and is allowed to run for up to ~5h55m.
-    # The 21:00 run therefore continues into the next UTC day until the
-    # GitHub runner limit, while the next weekday 09:00 run starts fresh.
     - cron: "30 3 * * 1-5"
     - cron: "30 9 * * 1-5"
     - cron: "30 15 * * 1-5"
@@ -43,7 +38,7 @@ permissions:
 jobs:
   market_session:
     runs-on: ubuntu-latest
-    # GitHub-hosted runner maximum is 6 hours. Keep a small safety margin.
+    # Keep a 5-minute safety margin for clean bridge shutdown.
     timeout-minutes: 355
     env:
       MARKETX_SYMBOL: ${{ inputs.symbol || 'CRUDEOIL26OCTFUT' }}
@@ -107,14 +102,14 @@ jobs:
           requested = os.environ.get("REQUESTED_PHASE", "").strip()
           now = datetime.now(timezone.utc)
 
-          # Manual phase selection is only a label for the log. The bridge
-          # session duration is always based on the actual job start time.
+          # Manual phase selection is only a label for the log.
           phase = requested if requested in {"1", "2", "3"} else "auto"
 
-          # Do not calculate a fixed market-clock end time here.
-          # The GitHub job timeout is the session boundary. This is the key
-          # change that prevents a late scheduled start from ending early.
-          session_seconds = 355 * 60
+          # IMPORTANT:
+          # Do not run the bridge all the way to the GitHub job timeout.
+          # GitHub must still have time to execute the finally block and
+          # exit this step normally. 350 min = 5h50m, leaving 5 min margin.
+          session_seconds = 350 * 60
           end_time = now.timestamp() + session_seconds
 
           log = open("marketx-session.log", "a", buffering=1)
@@ -163,6 +158,7 @@ jobs:
               if child is None or child.poll() is not None:
                   return
               try:
+                  print("MARKETX WATCHDOG | stopping bridge cleanly", flush=True)
                   os.killpg(child.pid, signal.SIGTERM)
                   child.wait(timeout=10)
               except Exception:
@@ -174,7 +170,7 @@ jobs:
           print(
               f"MARKETX WATCHDOG | phase={phase} | "
               f"start={now.isoformat()} | "
-              f"planned_session_minutes=355 | "
+              f"planned_session_minutes=350 | "
               f"planned_stop={datetime.fromtimestamp(end_time, timezone.utc).isoformat()}",
               flush=True,
           )
