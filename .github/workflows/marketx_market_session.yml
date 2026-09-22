@@ -1,19 +1,28 @@
 name: MarketX Market Session
-# MarketX scheduled market-session bridge
+# MarketX 6-hour rotating market-session bridge
+#
+# Each scheduled run gets its own fresh GitHub-hosted runner.
+# The bridge itself is supervised inside the job and restarts if the child
+# process exits. The job is intentionally allowed to run close to GitHub's
+# 6-hour hosted-runner limit so a late scheduled start does not shorten the
+# session because of a fixed market-phase end time.
 
 on:
   schedule:
-    # Three independent weekday starts.
     # 09:00 IST = 03:30 UTC
-    # 14:50 IST = 09:20 UTC
-    # 20:40 IST = 15:10 UTC
+    # 15:00 IST = 09:30 UTC
+    # 21:00 IST = 15:30 UTC
+    #
+    # Each run is independent and is allowed to run for up to ~5h55m.
+    # The 21:00 run therefore continues into the next UTC day until the
+    # GitHub runner limit, while the next weekday 09:00 run starts fresh.
     - cron: "30 3 * * 1-5"
-    - cron: "20 9 * * 1-5"
-    - cron: "10 15 * * 1-5"
+    - cron: "30 9 * * 1-5"
+    - cron: "30 15 * * 1-5"
   workflow_dispatch:
     inputs:
       phase:
-        description: Session phase (1=09:00-14:50 IST, 2=14:50-20:40 IST, 3=20:40-23:50 IST)
+        description: Manual session slot (1=09:00 IST, 2=15:00 IST, 3=21:00 IST)
         required: false
         default: "1"
         type: choice
@@ -34,6 +43,7 @@ permissions:
 jobs:
   market_session:
     runs-on: ubuntu-latest
+    # GitHub-hosted runner maximum is 6 hours. Keep a small safety margin.
     timeout-minutes: 355
     env:
       MARKETX_SYMBOL: ${{ inputs.symbol || 'CRUDEOIL26OCTFUT' }}
@@ -97,24 +107,15 @@ jobs:
           requested = os.environ.get("REQUESTED_PHASE", "").strip()
           now = datetime.now(timezone.utc)
 
-          if requested in {"1", "2", "3"}:
-              phase = requested
-          else:
-              minutes = now.hour * 60 + now.minute
-              if 3 * 60 + 30 <= minutes < 9 * 60 + 20:
-                  phase = "1"
-              elif 9 * 60 + 20 <= minutes < 15 * 60 + 10:
-                  phase = "2"
-              elif 15 * 60 + 10 <= minutes < 18 * 60 + 20:
-                  phase = "3"
-              else:
-                  print(f"Outside scheduled market session: {now.isoformat()}")
-                  raise SystemExit(0)
+          # Manual phase selection is only a label for the log. The bridge
+          # session duration is always based on the actual job start time.
+          phase = requested if requested in {"1", "2", "3"} else "auto"
 
-          targets = {"1": (9, 20), "2": (15, 10), "3": (18, 20)}
-          target_hour, target_minute = targets[phase]
-          target = now.replace(hour=target_hour, minute=target_minute, second=0, microsecond=0)
-          end_time = max(now, target)
+          # Do not calculate a fixed market-clock end time here.
+          # The GitHub job timeout is the session boundary. This is the key
+          # change that prevents a late scheduled start from ending early.
+          session_seconds = 355 * 60
+          end_time = now.timestamp() + session_seconds
 
           log = open("marketx-session.log", "a", buffering=1)
           restarts = 0
@@ -134,9 +135,12 @@ jobs:
                       pass
 
           def start_bridge():
-              global restarts
+              nonlocal restarts
               restarts += 1
-              print(f"MARKETX WATCHDOG | starting bridge | restart_count={restarts}", flush=True)
+              print(
+                  f"MARKETX WATCHDOG | starting bridge | restart_count={restarts}",
+                  flush=True,
+              )
               proc = subprocess.Popen(
                   ["python", "-u", "marketx_tick_bridge.py"],
                   stdout=subprocess.PIPE,
@@ -146,7 +150,11 @@ jobs:
                   start_new_session=True,
               )
               import threading
-              thread = threading.Thread(target=stream_bridge_output, args=(proc,), daemon=True)
+              thread = threading.Thread(
+                  target=stream_bridge_output,
+                  args=(proc,),
+                  daemon=True,
+              )
               thread.start()
               stream_threads.append(thread)
               return proc
@@ -165,25 +173,30 @@ jobs:
 
           print(
               f"MARKETX WATCHDOG | phase={phase} | "
-              f"start={now.isoformat()} stop={end_time.isoformat()}",
+              f"start={now.isoformat()} | "
+              f"planned_session_minutes=355 | "
+              f"planned_stop={datetime.fromtimestamp(end_time, timezone.utc).isoformat()}",
               flush=True,
           )
 
           try:
               child = start_bridge()
-              while datetime.now(timezone.utc) < end_time:
+
+              while time.time() < end_time:
                   code = child.poll()
                   if code is not None:
                       print(
-                          f"MARKETX WATCHDOG | BRIDGE EXITED code={code} | restarting in 5 sec",
+                          f"MARKETX WATCHDOG | BRIDGE EXITED code={code} | "
+                          f"restarting in 5 sec",
                           flush=True,
                       )
                       time.sleep(5)
-                      if datetime.now(timezone.utc) >= end_time:
+                      if time.time() >= end_time:
                           break
                       child = start_bridge()
                   else:
                       time.sleep(5)
+
           finally:
               stop_bridge()
               for thread in stream_threads:
