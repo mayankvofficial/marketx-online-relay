@@ -135,7 +135,7 @@ jobs:
                       pass
 
           def start_bridge():
-              nonlocal restarts
+              global restarts
               restarts += 1
               print(
                   f"MARKETX WATCHDOG | starting bridge | restart_count={restarts}",
