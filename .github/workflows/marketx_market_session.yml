@@ -1,10 +1,9 @@
 name: MarketX Market Session
-# MarketX 6-hour rotating market-session bridge
+# MarketX market-session bridge
 #
-# Each scheduled run gets its own fresh GitHub-hosted runner.
-# The bridge itself is supervised inside the job and restarts if the child
-# process exits. The bridge stops BEFORE the GitHub job timeout so the
-# supervisor can cleanly terminate the child and exit successfully.
+# The bridge has NO self-imposed time-based stop.
+# It keeps running and reconnecting/restarting its child until the
+# GitHub-hosted runner itself ends the job.
 
 on:
   schedule:
@@ -38,8 +37,9 @@ permissions:
 jobs:
   market_session:
     runs-on: ubuntu-latest
-    # Keep a 5-minute safety margin for clean bridge shutdown.
-    timeout-minutes: 355
+    # Use the full GitHub-hosted job timeout. There is no shorter
+    # MarketX-imposed session timer.
+    timeout-minutes: 360
     env:
       MARKETX_SYMBOL: ${{ inputs.symbol || 'CRUDEOIL26OCTFUT' }}
       MARKETX_TRADE99_URL: https://trade99.live:3000
@@ -105,13 +105,6 @@ jobs:
           # Manual phase selection is only a label for the log.
           phase = requested if requested in {"1", "2", "3"} else "auto"
 
-          # IMPORTANT:
-          # Do not run the bridge all the way to the GitHub job timeout.
-          # GitHub must still have time to execute the finally block and
-          # exit this step normally. 350 min = 5h50m, leaving 5 min margin.
-          session_seconds = 350 * 60
-          end_time = now.timestamp() + session_seconds
-
           log = open("marketx-session.log", "a", buffering=1)
           restarts = 0
           child = None
@@ -170,15 +163,17 @@ jobs:
           print(
               f"MARKETX WATCHDOG | phase={phase} | "
               f"start={now.isoformat()} | "
-              f"planned_session_minutes=350 | "
-              f"planned_stop={datetime.fromtimestamp(end_time, timezone.utc).isoformat()}",
+              f"self_imposed_stop=DISABLED",
               flush=True,
           )
 
           try:
               child = start_bridge()
 
-              while time.time() < end_time:
+              # No elapsed-time/session-end condition here.
+              # Keep the bridge alive until GitHub terminates the job
+              # or the bridge process exits and is restarted.
+              while True:
                   code = child.poll()
                   if code is not None:
                       print(
@@ -187,29 +182,21 @@ jobs:
                           flush=True,
                       )
                       time.sleep(5)
-                      if time.time() >= end_time:
-                          break
                       child = start_bridge()
                   else:
                       time.sleep(5)
 
           finally:
+              # Cleanup only when the GitHub job itself is being terminated.
+              # This is NOT a scheduled/session-time stop.
               stop_bridge()
               for thread in stream_threads:
                   thread.join(timeout=2)
               log.close()
-              print("MARKETX WATCHDOG | session ended", flush=True)
+              print("MARKETX WATCHDOG | process cleanup complete", flush=True)
           PY
 
       - name: Show MarketX session log
         if: always()
         run: |
           tail -n 200 marketx-session.log 2>/dev/null || true
-
-      - name: Stop MarketX bridge
-        if: always()
-        run: |
-          if [ -f marketx-session.pid ]; then
-            kill "$(cat marketx-session.pid)" 2>/dev/null || true
-          fi
-          tail -n 100 marketx-session.log 2>/dev/null || true
