@@ -357,11 +357,11 @@ def cleanup_previous_days(db):
         now_ist.date(), datetime.min.time(), tzinfo=ist
     ).astimezone(timezone.utc).isoformat()
 
-    db.execute(
+    cursor = db.execute(
         "DELETE FROM market_snapshots WHERE symbol = ? AND received_at < ?",
         (SYMBOL, today_start),
     )
-    deleted = db.total_changes
+    deleted = cursor.rowcount
     db.commit()
     if deleted:
         print(
