@@ -14,7 +14,7 @@ Environment:
     SUPABASE_PUBLISHABLE_KEY
 
 Optional:
-    MARKETX_SYMBOL=CRUDEOIL26SEPFUT
+    MARKETX_SYMBOL=CRUDEOIL26OCTFUT
     MARKETX_SYNC_DB=marketx_sync.db
     MARKETX_PAGE_SIZE=1000
     MARKETX_POLL_SECONDS=1
@@ -34,7 +34,7 @@ SUPABASE_URL = os.environ.get(
     "https://ynluiynxwnuubxcmxude.supabase.co",
 ).rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = os.environ.get("SUPABASE_PUBLISHABLE_KEY", "").strip()
-SYMBOL = os.environ.get("MARKETX_SYMBOL", "CRUDEOIL26SEPFUT").strip()
+SYMBOL = os.environ.get("MARKETX_SYMBOL", "CRUDEOIL26OCTFUT").strip()
 DB_PATH = os.environ.get("MARKETX_SYNC_DB", "marketx_sync.db")
 PAGE_SIZE = int(os.environ.get("MARKETX_PAGE_SIZE", "1000"))
 POLL_SECONDS = float(os.environ.get("MARKETX_POLL_SECONDS", "1"))
