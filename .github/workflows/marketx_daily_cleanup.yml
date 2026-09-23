@@ -1,0 +1,73 @@
+name: MarketX Daily Data Cleanup
+
+on:
+  schedule:
+    # 12:01 AM IST = 18:31 UTC (previous day)
+    - cron: "31 18 * * 1-5"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      SUPABASE_URL: https://ynluiynxwnuubxcmxude.supabase.co
+      SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+      MARKETX_SYMBOL: CRUDEOIL26OCTFUT
+
+    steps:
+      - name: Delete previous day's MarketX ticks
+        run: |
+          python - <<'PY'
+          import os
+          from datetime import datetime, timedelta, timezone
+          from zoneinfo import ZoneInfo
+          import requests
+
+          url = os.environ["SUPABASE_URL"].rstrip("/")
+          key = os.environ["SUPABASE_SECRET_KEY"].strip()
+          symbol = os.environ["MARKETX_SYMBOL"]
+
+          if not key:
+              raise SystemExit("SUPABASE_SECRET_KEY is not configured.")
+
+          ist = ZoneInfo("Asia/Kolkata")
+          now_ist = datetime.now(timezone.utc).astimezone(ist)
+
+          # At 00:01 IST, delete everything belonging to the previous IST day.
+          previous_day = (now_ist.date() - timedelta(days=1))
+          start_ist = datetime.combine(previous_day, datetime.min.time(), tzinfo=ist)
+          end_ist = start_ist + timedelta(days=1)
+
+          start_utc = start_ist.astimezone(timezone.utc).isoformat()
+          end_utc = end_ist.astimezone(timezone.utc).isoformat()
+
+          endpoint = f"{url}/rest/v1/market_snapshots"
+          headers = {
+              "apikey": key,
+              "Authorization": f"Bearer {key}",
+              "Prefer": "return=minimal",
+          }
+          params = {
+              "symbol": f"eq.{symbol}",
+              "received_at": f"gte.{start_utc}",
+              "received_at": f"lt.{end_utc}",
+          }
+
+          print(
+              f"MARKETX DAILY CLEANUP | deleting symbol={symbol} | "
+              f"IST day={previous_day} | {start_utc} -> {end_utc}"
+          )
+
+          r = requests.delete(endpoint, headers=headers, params=params, timeout=60)
+
+          print(f"MARKETX DAILY CLEANUP | HTTP {r.status_code}")
+          if r.status_code >= 300:
+              print("Response:", r.text[:1000])
+              raise SystemExit("Daily MarketX data cleanup failed.")
+
+          print("MARKETX DAILY CLEANUP | COMPLETE")
+          PY
