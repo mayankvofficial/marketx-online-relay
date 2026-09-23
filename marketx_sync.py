@@ -345,6 +345,31 @@ def sync_once(db):
             return total
 
 
+def cleanup_previous_days(db):
+    # Keep only the current IST calendar day locally. Run at/after 00:01 IST
+    # on the first sync loop after midnight. If the phone was offline at
+    # 00:01, cleanup happens immediately when sync reconnects.
+    from zoneinfo import ZoneInfo
+
+    ist = ZoneInfo("Asia/Kolkata")
+    now_ist = datetime.now(timezone.utc).astimezone(ist)
+    today_start = datetime.combine(
+        now_ist.date(), datetime.min.time(), tzinfo=ist
+    ).astimezone(timezone.utc).isoformat()
+
+    db.execute(
+        "DELETE FROM market_snapshots WHERE symbol = ? AND received_at < ?",
+        (SYMBOL, today_start),
+    )
+    deleted = db.total_changes
+    db.commit()
+    if deleted:
+        print(
+            f"MARKETX DAILY CLEANUP | deleted={deleted} | kept_ist_date={now_ist.date()}",
+            flush=True,
+        )
+    return deleted
+
 def main():
     db = open_db()
     last_verify = 0.0
@@ -355,31 +380,17 @@ def main():
         flush=True,
     )
 
+    cleanup_day = None
+
     while True:
         try:
+            from zoneinfo import ZoneInfo
+            now_ist = datetime.now(timezone.utc).astimezone(ZoneInfo("Asia/Kolkata"))
+            if now_ist.hour == 0 and now_ist.minute >= 1 and cleanup_day != now_ist.date():
+                cleanup_previous_days(db)
+                cleanup_day = now_ist.date()
+
             sync_once(db)
-            now = time.monotonic()
-            if now - last_verify >= VERIFY_SECONDS:
-                checkpoint = verify_checkpoint(db)
-                lag = sync_lag(db)
-                health = bridge_health()
-                gap = latest_capture_gap()
-                print(f"MARKETX INTEGRITY | {checkpoint} | SYNC={lag}", flush=True)
-                print(
-                    f"MARKETX CAPTURE GAP | {gap if gap else 'NONE DETECTED'}",
-                    flush=True,
-                )
-                print(
-                    f"MARKETX BRIDGE HEALTH | LAST TICK: {health.get('last_tick')} | "
-                    f"TICK AGE: {health.get('tick_age_sec')} sec | "
-                    f"STATUS: {health.get('status')} | "
-                    f"LAST UPLOAD: {health.get('last_upload')} | "
-                    f"HEARTBEAT AGE: {health.get('heartbeat_age_sec')} sec | "
-                    f"PENDING: {health.get('pending')} | "
-                    f"ERROR: {health.get('error')}",
-                    flush=True,
-                )
-                last_verify = now
         except KeyboardInterrupt:
             print("MARKETX SYNC STOPPED", flush=True)
             break
